@@ -9,12 +9,12 @@ warnings.filterwarnings('ignore')
 # ============================================
 
 COUNTRY_CODES = [
-    'IND', 'BGD', 'PAK', 'LKA',
-    'VNM', 'PHL', 'IDN', 'THA',
-    'CHN', 'KOR',
-    'BRA', 'MEX', 'COL', 'ARG', 'CHL',
-    'NGA', 'ZAF', 'EGY',
-    'TUR', 'IRN'
+    # South Asia (7)
+    'IND', 'BGD', 'PAK', 'LKA', 'NPL', 'AFG', 'BTN',
+    # Southeast Asia (10)
+    'VNM', 'PHL', 'IDN', 'THA', 'MYS', 'KHM', 'MMR', 'LAO', 'SGP', 'TLS',
+    # East Asia comparators (8)
+    'CHN', 'KOR', 'JPN', 'MNG', 'HKG', 'MAC', 'BRN', 'TWN',
 ]
 
 YEARS = range(1990, 2025)
@@ -23,13 +23,19 @@ DATA_DIR = Path('data/raw')
 OUTPUT_PATH = Path('data/processed/cleaned_panel.csv')
 
 # Country name to ISO3 mapping (for Berkeley Earth, etc.)
+# 25 Asian economies — South Asia, Southeast Asia, East Asia
 COUNTRY_MAPPING = {
+    # South Asia
     'India': 'IND', 'Bangladesh': 'BGD', 'Pakistan': 'PAK', 'Sri Lanka': 'LKA',
+    'Nepal': 'NPL', 'Afghanistan': 'AFG', 'Bhutan': 'BTN',
+    # Southeast Asia
     'Vietnam': 'VNM', 'Philippines': 'PHL', 'Indonesia': 'IDN', 'Thailand': 'THA',
-    'China': 'CHN', 'South Korea': 'KOR',
-    'Brazil': 'BRA', 'Mexico': 'MEX', 'Colombia': 'COL', 'Argentina': 'ARG', 'Chile': 'CHL',
-    'Nigeria': 'NGA', 'South Africa': 'ZAF', 'Egypt': 'EGY',
-    'Turkey': 'TUR', 'Iran': 'IRN'
+    'Malaysia': 'MYS', 'Cambodia': 'KHM', 'Myanmar': 'MMR', 'Lao PDR': 'LAO',
+    'Singapore': 'SGP', 'Timor-Leste': 'TLS',
+    # East Asia
+    'China': 'CHN', 'South Korea': 'KOR', 'Japan': 'JPN', 'Mongolia': 'MNG',
+    'Hong Kong SAR': 'HKG', 'Macao SAR': 'MAC', 'Brunei Darussalam': 'BRN',
+    'Taiwan': 'TWN',
 }
 
 # ============================================
@@ -151,8 +157,9 @@ def load_climate_data():
 
 def main():
     print("="*70)
-    print("QREI DATA PREPARATION PIPELINE")
+    print("QREI DATA PREPARATION PIPELINE — 25 ASIAN ECONOMIES")
     print("="*70)
+    print(f"\nSample: South Asia (7) + Southeast Asia (10) + East Asia (8)")
     print(f"\nProcessing data for:")
     print(f"  - Countries: {len(COUNTRY_CODES)}")
     print(f"  - Years: {min(YEARS)}-{max(YEARS)} ({len(YEARS)} years)")
