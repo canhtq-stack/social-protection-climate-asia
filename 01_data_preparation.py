@@ -1,468 +1,381 @@
-import pandas as pd
-import numpy as np
-from pathlib import Path
+"""
+01_tabnet_causal.py
+===================
+Pipeline: XGBoost + TabNet (SHAP) → CausalForestDML (Baseline Estimation)
+
+Paper : "Social Protection as Climate Adaptation: Heterogeneous Effects
+         on Income Inequality in Asia"
+Journal: Economics of Disasters and Climate Change, Springer
+
+Outputs
+-------
+output/models/xgb_model.pkl
+output/models/tabnet_model.*
+output/models/causal_forest_baseline.pkl
+output/tables/shap_xgb.csv
+output/tables/shap_tabnet.csv
+output/tables/shap_merged_table4.csv       → Table 4 in manuscript
+output/tables/ate_summary.csv
+output/tables/cate_individual.csv          → used by 04_blp_subsample.py
+output/tables/cate_by_country.csv          → Table 2 / Figure 2
+output/figures/figure3_shap_beeswarm.png   → Figure 3
+output/figures/figure3b_shap_bar.png
+"""
+
+import os
 import warnings
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import joblib
+import shap
 
-# ============================================
-# CONFIGURATION
-# ============================================
+from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import GroupKFold, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+from pytorch_tabnet.tab_model import TabNetRegressor
+from econml.dml import CausalForestDML
 
-COUNTRY_CODES = [
-    # South Asia (7)
-    'IND', 'BGD', 'PAK', 'LKA', 'NPL', 'AFG', 'BTN',
-    # Southeast Asia (10)
-    'VNM', 'PHL', 'IDN', 'THA', 'MYS', 'KHM', 'MMR', 'LAO', 'SGP', 'TLS',
-    # East Asia comparators (8)
-    'CHN', 'KOR', 'JPN', 'MNG', 'HKG', 'MAC', 'BRN', 'TWN',
+warnings.filterwarnings("ignore")
+
+# ── Reproducibility ────────────────────────────────────────────────────────
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+# ── Paths (relative to repo root) ─────────────────────────────────────────
+ROOT       = Path(__file__).resolve().parents[1]
+DATA_FILE  = ROOT / "data" / "panel_qrei_final.csv"
+MODEL_DIR  = ROOT / "output" / "models"
+TABLE_DIR  = ROOT / "output" / "tables"
+FIGURE_DIR = ROOT / "output" / "figures"
+
+for d in [MODEL_DIR, TABLE_DIR, FIGURE_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ── Model hyperparameters ──────────────────────────────────────────────────
+N_FOLDS = 5
+
+TABNET_CONFIG = dict(
+    mask_type="entmax", n_d=32, n_a=32, n_steps=5, gamma=1.3,
+    n_independent=2, n_shared=2, momentum=0.02, epsilon=1e-15,
+    seed=RANDOM_SEED, verbose=0,
+)
+TABNET_FIT = dict(
+    max_epochs=200, patience=50, batch_size=256,
+    virtual_batch_size=128, num_workers=0,
+)
+
+# ── Variable definitions ───────────────────────────────────────────────────
+Y_COL = "delta_gini"
+T_COL = "high_social_prot"
+
+# Effect modifiers X (forest splitting space; Table 4 SHAP)
+X_COLS = [
+    "temp_shock", "extreme_temp_shock", "rice_yield_dev",
+    "log_gdp_pc", "rule_of_law", "democracy_electoral", "disaster_count_cy",
 ]
+# Confounders W (partialled out by DML nuisance models)
+W_COLS = ["log_gdp_pc_lag1", "gini_lag1", "corruption_index", "temp_shock_lag1"]
 
-YEARS = range(1990, 2025)
+# Full feature set for SHAP auxiliary models (includes coverage for Table 4)
+FEATURE_COLS = X_COLS + ["gini_lag1", "social_prot_coverage", "corruption_index"]
 
-DATA_DIR = Path('data/raw')
-OUTPUT_PATH = Path('data/processed/cleaned_panel.csv')
-
-# Country name to ISO3 mapping (for Berkeley Earth, etc.)
-# 25 Asian economies — South Asia, Southeast Asia, East Asia
-COUNTRY_MAPPING = {
-    # South Asia
-    'India': 'IND', 'Bangladesh': 'BGD', 'Pakistan': 'PAK', 'Sri Lanka': 'LKA',
-    'Nepal': 'NPL', 'Afghanistan': 'AFG', 'Bhutan': 'BTN',
-    # Southeast Asia
-    'Vietnam': 'VNM', 'Philippines': 'PHL', 'Indonesia': 'IDN', 'Thailand': 'THA',
-    'Malaysia': 'MYS', 'Cambodia': 'KHM', 'Myanmar': 'MMR', 'Lao PDR': 'LAO',
-    'Singapore': 'SGP', 'Timor-Leste': 'TLS',
-    # East Asia
-    'China': 'CHN', 'South Korea': 'KOR', 'Japan': 'JPN', 'Mongolia': 'MNG',
-    'Hong Kong SAR': 'HKG', 'Macao SAR': 'MAC', 'Brunei Darussalam': 'BRN',
-    'Taiwan': 'TWN',
+LABEL_MAP = {
+    "rule_of_law":         "Rule of law",
+    "democracy_electoral": "Electoral democracy",
+    "log_gdp_pc":          "Log GDP per capita",
+    "social_prot_coverage":"Social protection coverage",
+    "corruption_index":    "Corruption index",
+    "gini_lag1":           "Lagged Gini",
+    "temp_shock":          "Temperature shock",
+    "rice_yield_dev":      "Rice yield deviation",
+    "extreme_temp_shock":  "Extreme temp. shock",
+    "disaster_count_cy":   "Disaster count",
+    "log_gdp_pc_lag1":     "Lagged log GDP per capita",
+    "temp_shock_lag1":     "Lagged temp. anomaly",
 }
 
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
+# ── Helpers ────────────────────────────────────────────────────────────────
 
-def load_wb_csv(filepath, value_col_name):
-    
-   # Load World Bank CSV (already processed by download script)
+def section(title, step):
+    print(f"\n{'='*70}\nSTEP {step}: {title}\n{'='*70}")
 
-    try:
-        df = pd.read_csv(filepath)
-        df = df[['country_code', 'year', value_col_name]]
-        df = df[
-            (df['country_code'].isin(COUNTRY_CODES)) &
-            (df['year'].isin(YEARS))
-        ]
-        return df
-    except FileNotFoundError:
-        print(f"  ⚠ File not found: {filepath}")
-        return None
+def available(cols, df):
+    return [c for c in cols if c in df.columns]
 
-def load_vdem():
-    "Load V-Dem democracy indicators"
-    filepath = DATA_DIR / 'institutions/vdem_full_v14.csv'
-    
-    if not filepath.exists():
-        print(f"  ⚠ V-Dem file not found. Creating placeholder.")
-        # Return empty dataframe with correct structure
-        return pd.DataFrame(columns=['country_code', 'year', 'democracy_electoral', 
-                                      'democracy_liberal', 'corruption_index', 'rule_of_law'])
-    
-    df = pd.read_csv(filepath)
-    
-    # V-Dem variable names (check actual column names in downloaded file)
-    vdem_vars = {
-        'country_text_id': 'country_code',  # Usually 3-letter code
-        'year': 'year',
-        'v2x_polyarchy': 'democracy_electoral',
-        'v2x_libdem': 'democracy_liberal',
-        'v2x_corr': 'corruption_index',
-        'v2x_rule': 'rule_of_law'
-    }
-    
-    # Check if columns exist
-    available_cols = [col for col in vdem_vars.keys() if col in df.columns]
-    df = df[available_cols]
-    df = df.rename(columns=vdem_vars)
-    
-    # Filter
-    df = df[
-        (df['country_code'].isin(COUNTRY_CODES)) &
-        (df['year'].isin(YEARS))
-    ]
-    
-    return df
+def save_table(df, filename, label=""):
+    path = TABLE_DIR / filename
+    df.to_csv(path, index=True)
+    print(f"  ✓ {filename}" + (f"  [{label}]" if label else ""))
 
-def load_emdat():
-    "Load EM-DAT disaster data"
-    filepath = DATA_DIR / 'climate/emdat_disasters.csv'
-    
-    if not filepath.exists():
-        print(f"  ⚠ EM-DAT file not found. Creating placeholder.")
-        return pd.DataFrame(columns=['country_code', 'year', 'disaster_count', 
-                                      'disaster_deaths', 'disaster_affected'])
-    
-    df = pd.read_csv(filepath)
-    
-    # EM-DAT column names (verify with actual file)
-    # Typical structure: ISO, Year, Disaster Type, Total Deaths, Total Affected, Total Damages
-    
-    # Aggregate by country-year
-    df_agg = df.groupby(['ISO', 'Year']).agg({
-        'Disaster Type': 'count',  # Number of disasters
-        'Total Deaths': lambda x: x.fillna(0).sum(),
-        'Total Affected': lambda x: x.fillna(0).sum(),
-        "Total Damages ('000 US$)": lambda x: x.fillna(0).sum()
-    }).reset_index()
-    
-    df_agg = df_agg.rename(columns={
-        'ISO': 'country_code',
-        'Year': 'year',
-        'Disaster Type': 'disaster_count',
-        'Total Deaths': 'disaster_deaths',
-        'Total Affected': 'disaster_affected',
-        "Total Damages ('000 US$)": 'disaster_damages_k_usd'
-    })
-    
-    df_agg = df_agg[
-        (df_agg['country_code'].isin(COUNTRY_CODES)) &
-        (df_agg['year'].isin(YEARS))
-    ]
-    
-    return df_agg
+def save_figure(fig, filename):
+    path = FIGURE_DIR / filename
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ {filename}")
 
-def load_climate_data():
-    "Load temperature and precipitation data"
-    
-    # Option 1: If you have NOAA CSV
-    climate_file = DATA_DIR / 'climate/noaa_climate.csv'
-    
-    if climate_file.exists():
-        df = pd.read_csv(climate_file)
-        df = df[['country_code', 'year', 'temp_anomaly_celsius', 'precip_anomaly_mm']]
-        return df
-    
-    # Option 2: If manual entry needed, use template
-    else:
-        print("  ⚠ Climate data not found. Using template.")
-        print("  → Please fill: data/raw/climate/noaa_climate_TEMPLATE.csv")
-        
-        # Load template
-        df = pd.read_csv(DATA_DIR / 'climate/noaa_climate_TEMPLATE.csv')
-        return df
+# ── STEP 1: Load data ──────────────────────────────────────────────────────
+section("LOAD DATA", 1)
 
-# ============================================
-# MAIN PIPELINE
-# ============================================
-
-def main():
-    print("="*70)
-    print("QREI DATA PREPARATION PIPELINE — 25 ASIAN ECONOMIES")
-    print("="*70)
-    print(f"\nSample: South Asia (7) + Southeast Asia (10) + East Asia (8)")
-    print(f"\nProcessing data for:")
-    print(f"  - Countries: {len(COUNTRY_CODES)}")
-    print(f"  - Years: {min(YEARS)}-{max(YEARS)} ({len(YEARS)} years)")
-    print(f"  - Expected observations: ~{len(COUNTRY_CODES) * len(YEARS)}")
-    
-    # ==================== STEP 1: LOAD INEQUALITY DATA ====================
-    print("\n" + "="*70)
-    print("STEP 1/7: LOADING INEQUALITY DATA (BASE DATASET)")
-    print("="*70)
-    
-    df_gini = load_wb_csv(
-        DATA_DIR / 'inequality/wb_gini.csv',
-        'gini'
+if not DATA_FILE.exists():
+    raise FileNotFoundError(
+        f"Data file not found: {DATA_FILE}\n"
+        "Place panel_qrei_final.csv in the data/ directory.\n"
+        "See data/README_data.md for download instructions."
     )
-    
-    if df_gini is None:
-        print("  ✗ CRITICAL: Gini data not found!")
-        print("  → Please run download_data.py first")
-        return None
-    
-    print(f"  ✓ Loaded {len(df_gini)} observations")
-    print(f"  ✓ Non-missing Gini: {df_gini['gini'].notna().sum()} ({df_gini['gini'].notna().sum()/len(df_gini)*100:.1f}%)")
-    
-    # Start with Gini as base
-    df = df_gini.copy()
-    
-    # ==================== STEP 2: LOAD CLIMATE DATA ====================
-    print("\n" + "="*70)
-    print("STEP 2/7: LOADING CLIMATE DATA")
-    print("="*70)
-    
-    # Temperature & precipitation
-    df_climate = load_climate_data()
-    print(f"  ✓ Loaded climate data: {len(df_climate)} observations")
-    
-    # Disasters
-    df_disasters = load_emdat()
-    print(f"  ✓ Loaded disaster data: {len(df_disasters)} observations")
-    
-    # Merge climate
-    df = df.merge(df_climate, on=['country_code', 'year'], how='left')
-    df = df.merge(df_disasters, on=['country_code', 'year'], how='left')
-    
-    print(f"  ✓ After merge: {len(df)} observations")
-    
-    # ==================== STEP 3: LOAD INSTITUTIONAL DATA ====================
-    print("\n" + "="*70)
-    print("STEP 3/7: LOADING INSTITUTIONAL DATA")
-    print("="*70)
-    
-    # V-Dem
-    df_vdem = load_vdem()
-    if len(df_vdem) > 0:
-        df = df.merge(df_vdem, on=['country_code', 'year'], how='left')
-        print(f"  ✓ Merged V-Dem: {df['democracy_electoral'].notna().sum()} non-missing")
+
+df = pd.read_csv(DATA_FILE, low_memory=False)
+print(f"  Loaded: {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+# Create binary treatment if missing
+if T_COL not in df.columns:
+    if "social_prot_coverage" in df.columns:
+        median_cov = df["social_prot_coverage"].median()
+        df[T_COL] = (df["social_prot_coverage"].fillna(0) > median_cov).astype(float)
+        print(f"  Created '{T_COL}' (threshold = {median_cov:.1f}%)")
     else:
-        print("  ⚠ V-Dem data empty (manual download needed)")
-    
-    # World Bank Governance Indicators
-    wgi_vars = ['control_of_corruption', 'government_effectiveness', 'rule_of_law']
-    for var in wgi_vars:
-        df_wgi = load_wb_csv(DATA_DIR / f'institutions/wgi_{var}.csv', var)
-        if df_wgi is not None:
-            df = df.merge(df_wgi, on=['country_code', 'year'], how='left')
-            print(f"  ✓ Merged WGI {var}")
-    
-    # ==================== STEP 4: LOAD CONTROL VARIABLES ====================
-    print("\n" + "="*70)
-    print("STEP 4/7: LOADING CONTROL VARIABLES")
-    print("="*70)
-    
-    controls = {
-        'gdp_pc_constant2015usd': 'controls/wb_gdp_per_capita.csv',
-        'population': 'controls/wb_population.csv',
-        'agriculture_pct_gdp': 'controls/wb_agriculture_pct_gdp.csv',
-        'urban_population_pct': 'controls/wb_urban_pct.csv',
-        'trade_pct_gdp': 'controls/wb_trade_pct_gdp.csv',
-        'gdp_growth_annual_pct': 'controls/wb_gdp_growth.csv'
-    }
-    
-    for var_name, filepath in controls.items():
-        df_ctrl = load_wb_csv(DATA_DIR / filepath, var_name)
-        if df_ctrl is not None:
-            df = df.merge(df_ctrl, on=['country_code', 'year'], how='left')
-            print(f"  ✓ Merged {var_name}")
-    
-    print(f"  ✓ Total variables after merge: {len(df.columns)}")
-    
-    # ==================== STEP 5: FEATURE ENGINEERING ====================
-    print("\n" + "="*70)
-    print("STEP 5/7: FEATURE ENGINEERING")
-    print("="*70)
-    
-    # Sort by country and year
-    df = df.sort_values(['country_code', 'year']).reset_index(drop=True)
-    
-    # Climate shock: Standardized temperature deviation
-    print("  → Creating climate shock variables...")
-    df['temp_shock'] = df.groupby('country_code')['temp_anomaly_celsius'].transform(
-        lambda x: (x - x.rolling(10, min_periods=5).mean()) / 
-                  (x.rolling(10, min_periods=5).std() + 1e-6)  # Avoid division by zero
-    )
-    
-    # Extreme shock indicator (>2 standard deviations)
-    df['extreme_temp_shock'] = (df['temp_shock'].abs() > 2).astype(float)
-    
-    # Drought indicator (temperature high + precipitation low)
-    # (Requires precipitation data)
-    if 'precip_anomaly_mm' in df.columns:
-        df['drought_risk'] = (
-            (df['temp_anomaly_celsius'] > df['temp_anomaly_celsius'].median()) &
-            (df['precip_anomaly_mm'] < df['precip_anomaly_mm'].median())
-        ).astype(float)
-    
-    # Log transformations
-    print("  → Creating log-transformed variables...")
-    df['log_gdp_pc'] = np.log(df['gdp_pc_constant2015usd'].replace(0, np.nan))
-    df['log_population'] = np.log(df['population'].replace(0, np.nan))
-    
-    # Lagged variables (for instruments and dynamic analysis)
-    print("  → Creating lagged variables...")
-    for lag in [1, 3, 5]:
-        df[f'gini_lag{lag}'] = df.groupby('country_code')['gini'].shift(lag)
-        df[f'democracy_lag{lag}'] = df.groupby('country_code')['democracy_electoral'].shift(lag)
-        df[f'gdp_pc_lag{lag}'] = df.groupby('country_code')['gdp_pc_constant2015usd'].shift(lag)
-    
-    # First differences (for growth analysis)
-    df['gini_change'] = df.groupby('country_code')['gini'].diff()
-    df['gdp_pc_change'] = df.groupby('country_code')['gdp_pc_constant2015usd'].diff()
-    
-    # Treatment indicators (for causal analysis)
-    print("  → Creating treatment indicators...")
-    if 'democracy_electoral' in df.columns:
-        df['high_democracy'] = (df['democracy_electoral'] > df['democracy_electoral'].median()).astype(float)
-        df['democracy_change'] = df.groupby('country_code')['democracy_electoral'].diff()
-        df['democratization'] = (df['democracy_change'] > 0.1).astype(float)  # Significant increase
-    
-    if 'rule_of_law' in df.columns:
-        df['strong_institutions'] = (df['rule_of_law'] > df['rule_of_law'].median()).astype(float)
-    
-    # Disaster intensity (normalized)
-    if 'disaster_damages_k_usd' in df.columns:
-        df['disaster_intensity'] = (
-            df['disaster_damages_k_usd'] / (df['gdp_pc_constant2015usd'] * df['population'] / 1000 + 1)
+        raise KeyError(f"Column '{T_COL}' missing and 'social_prot_coverage' not found.")
+
+feat_cols = available(FEATURE_COLS, df)
+x_cols    = available(X_COLS, df)
+w_cols    = available(W_COLS, df)
+
+df_model = df[df[Y_COL].notna() & df[T_COL].notna()].copy()
+print(f"  Estimation sample: {len(df_model):,} obs")
+
+# Impute missing values (country median → global median)
+for col in set(feat_cols + x_cols + w_cols):
+    if col in df_model.columns and df_model[col].isnull().any():
+        df_model[col] = (
+            df_model.groupby("country_code")[col]
+            .transform(lambda x: x.fillna(x.median()))
         )
-    
-    print(f"  ✓ Created {len([c for c in df.columns if any(x in c for x in ['lag', 'shock', 'change', 'log'])])} derived features")
-    
-    # ==================== STEP 6: HANDLE MISSING DATA ====================
-    print("\n" + "="*70)
-    print("STEP 6/7: HANDLING MISSING DATA")
-    print("="*70)
-    
-    initial_rows = len(df)
-    print(f"  Initial observations: {initial_rows}")
-    
-    # Report missing data before cleaning
-    missing_before = df[['gini', 'temp_anomaly_celsius', 'democracy_electoral', 
-                          'gdp_pc_constant2015usd']].isnull().sum()
-    print("\n  Missing data (key variables):")
-    for var, count in missing_before.items():
-        pct = count / len(df) * 100
-        print(f"    {var}: {count} ({pct:.1f}%)")
-    
-    # Strategy 1: Drop rows with missing Gini (our outcome)
-    df = df.dropna(subset=['gini'])
-    print(f"\n  → After dropping missing Gini: {len(df)} rows ({initial_rows - len(df)} dropped)")
-    
-    # Strategy 2: Interpolate slow-moving variables
-    print("\n  → Interpolating slow-moving variables...")
-    slow_vars = ['democracy_electoral', 'rule_of_law', 'urban_population_pct', 
-                 'control_of_corruption', 'government_effectiveness']
-    
-    for var in slow_vars:
-        if var in df.columns:
-            before = df[var].isnull().sum()
-            df[var] = df.groupby('country_code')[var].transform(
-                lambda x: x.interpolate(method='linear', limit=3, limit_direction='both')
-            )
-            after = df[var].isnull().sum()
-            if before > after:
-                print(f"    {var}: filled {before - after} gaps")
-    
-    # Strategy 3: Fill disaster variables with 0 (no disaster = no impact)
-    disaster_cols = [c for c in df.columns if 'disaster' in c]
-    df[disaster_cols] = df[disaster_cols].fillna(0)
-    print(f"  → Filled {len(disaster_cols)} disaster variables with 0")
-    
-    # Strategy 4: Forward fill for very sparse data (max 1 year gap)
-    df = df.sort_values(['country_code', 'year'])
-    sparse_vars = ['agriculture_pct_gdp', 'trade_pct_gdp']
-    for var in sparse_vars:
-        if var in df.columns:
-            df[var] = df.groupby('country_code')[var].fillna(method='ffill', limit=1)
-    
-    # Final missing data report
-    print("\n  Missing data after cleaning:")
-    core_vars = ['gini', 'temp_anomaly_celsius', 'democracy_electoral', 
-                 'gdp_pc_constant2015usd', 'population']
-    missing_after = df[core_vars].isnull().sum()
-    for var, count in missing_after.items():
-        pct = count / len(df) * 100
-        print(f"    {var}: {count} ({pct:.1f}%)")
-    
-    # ==================== STEP 7: QUALITY CHECKS & SAVE ====================
-    print("\n" + "="*70)
-    print("STEP 7/7: QUALITY CHECKS & SAVE")
-    print("="*70)
-    
-    # Outlier detection
-    print("\n  Checking for outliers...")
-    outlier_vars = ['gini', 'temp_shock', 'gdp_growth_annual_pct']
-    for var in outlier_vars:
-        if var in df.columns:
-            q1, q3 = df[var].quantile([0.01, 0.99])
-            outliers = ((df[var] < q1) | (df[var] > q3)).sum()
-            print(f"    {var}: {outliers} potential outliers (outside 1-99 percentile)")
-    
-    # Balance check
-    print("\n  Country-year balance:")
-    balance = df.groupby('country_code').size()
-    print(f"    Min observations per country: {balance.min()}")
-    print(f"    Max observations per country: {balance.max()}")
-    print(f"    Mean observations per country: {balance.mean():.1f}")
-    
-    # Countries with <50% data
-    sparse_countries = balance[balance < len(YEARS) * 0.5].index.tolist()
-    if sparse_countries:
-        print(f"\n  ⚠ Countries with <50% year coverage: {', '.join(sparse_countries)}")
-        print("    → Consider excluding in sensitivity analysis")
-    
-    # Variable summary
-    print("\n" + "="*70)
-    print("FINAL DATASET SUMMARY")
-    print("="*70)
-    print(f"\n  Observations: {len(df)}")
-    print(f"  Countries: {df['country_code'].nunique()}")
-    print(f"  Years: {df['year'].min()}-{df['year'].max()}")
-    print(f"  Variables: {len(df.columns)}")
-    print(f"\n  Coverage rates (non-missing):")
-    coverage = (df.notna().sum() / len(df) * 100).sort_values(ascending=False)
-    print(coverage.head(15).to_string())
-    
-    # Save
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(OUTPUT_PATH, index=False)
-    print(f"\n✓ Cleaned data saved to: {OUTPUT_PATH}")
-    
-    # Generate descriptive statistics
-    print("\n  Generating descriptive statistics...")
-    Path('results/tables').mkdir(parents=True, exist_ok=True)
-    
-    desc_vars = ['gini', 'temp_anomaly_celsius', 'temp_shock', 'democracy_electoral',
-                 'gdp_pc_constant2015usd', 'population', 'disaster_count']
-    desc_vars = [v for v in desc_vars if v in df.columns]
-    
-    desc_stats = df[desc_vars].describe()
-    desc_stats.to_csv('results/tables/descriptive_stats.csv')
-    print(f"  ✓ Saved to: results/tables/descriptive_stats.csv")
-    
-    # Correlation matrix
-    corr_vars = ['gini', 'temp_shock', 'democracy_electoral', 'log_gdp_pc', 
-                 'agriculture_pct_gdp', 'disaster_count']
-    corr_vars = [v for v in corr_vars if v in df.columns and df[v].notna().sum() > 50]
-    
-    if len(corr_vars) > 2:
-        corr_matrix = df[corr_vars].corr()
-        corr_matrix.to_csv('results/tables/correlation_matrix.csv')
-        print(f"  ✓ Correlation matrix saved")
-    
-    # Save variable definitions
-    var_defs = {
-        'gini': 'Gini coefficient (0-100)',
-        'temp_anomaly_celsius': 'Temperature anomaly (°C relative to baseline)',
-        'temp_shock': 'Standardized temperature deviation (z-score)',
-        'extreme_temp_shock': 'Indicator for extreme shock (|z|>2)',
-        'democracy_electoral': 'Electoral democracy index (0-1)',
-        'gdp_pc_constant2015usd': 'GDP per capita (constant 2015 USD)',
-        'disaster_count': 'Number of natural disasters in year',
-        'log_gdp_pc': 'Log of GDP per capita',
-        'gini_lag1': 'Gini coefficient lagged 1 year',
-        'high_democracy': 'Indicator for above-median democracy'
-    }
-    
-    with open('data/metadata/variable_definitions.txt', 'w') as f:
-        f.write("QREI Project - Variable Definitions\n")
-        f.write("="*70 + "\n\n")
-        for var, definition in var_defs.items():
-            f.write(f"{var}:\n  {definition}\n\n")
-    
-    print(f"  ✓ Variable definitions saved")
-    
-    print("\n" + "="*70)
-    print("DATA PREPARATION COMPLETE!")
-    print("="*70)
-    print("\nNext steps:")
-    print("  1. Review: results/tables/descriptive_stats.csv")
-    print("  2. Check: results/tables/correlation_matrix.csv")
-    print("  3. Run: python code/02_exploratory_analysis.py")
-    print("="*70)
-    
-    return df
+        df_model[col] = df_model[col].fillna(df_model[col].median())
 
+X_all    = df_model[feat_cols].values.astype(np.float32)
+y_all    = df_model[Y_COL].values.astype(np.float32)
+T_all    = df_model[T_COL].values.astype(np.float32)
+groups   = df_model["country_code"].values
+scaler   = StandardScaler()
+X_scaled = scaler.fit_transform(X_all)
 
-if __name__ == '__main__':
-    df = main()
+print(f"  Feature matrix: {X_all.shape}  |  Treated share: {T_all.mean():.3f}")
+
+# ── STEP 2: XGBoost + SHAP ────────────────────────────────────────────────
+section("XGBoost — Train + SHAP", 2)
+
+xgb_model = xgb.XGBRegressor(
+    n_estimators=500, max_depth=5, learning_rate=0.05,
+    subsample=0.8, colsample_bytree=0.8,
+    random_state=RANDOM_SEED, n_jobs=-1, verbosity=0,
+)
+xgb_model.fit(X_scaled, y_all)
+
+gkf  = GroupKFold(n_splits=N_FOLDS)
+cv_r2 = cross_val_score(
+    xgb_model, X_scaled, y_all,
+    cv=gkf.split(X_scaled, y_all, groups), scoring="r2",
+)
+print(f"  CV R² = {cv_r2.mean():.4f} ± {cv_r2.std():.4f}")
+
+joblib.dump(xgb_model, MODEL_DIR / "xgb_model.pkl")
+
+explainer_xgb = shap.TreeExplainer(xgb_model)
+shap_vals_xgb = explainer_xgb.shap_values(X_scaled)
+mean_shap_xgb = np.abs(shap_vals_xgb).mean(axis=0)
+
+df_shap_xgb = pd.DataFrame({
+    "Feature":       feat_cols,
+    "XGB_mean_shap": mean_shap_xgb,
+    "XGB_rank":      pd.Series(mean_shap_xgb).rank(ascending=False).astype(int).values,
+}).sort_values("XGB_mean_shap", ascending=False)
+
+save_table(df_shap_xgb.set_index("Feature"), "shap_xgb.csv", "XGBoost SHAP")
+
+# ── STEP 3: TabNet + SHAP ─────────────────────────────────────────────────
+section("TabNet — Train + SHAP", 3)
+
+X_tab = X_scaled.astype(np.float32)
+y_tab = y_all.reshape(-1, 1).astype(np.float32)
+
+n_val   = max(int(len(X_tab) * 0.2), 10)
+n_train = len(X_tab) - n_val
+
+tabnet = TabNetRegressor(**TABNET_CONFIG)
+tabnet.fit(
+    X_train=X_tab[:n_train], y_train=y_tab[:n_train],
+    eval_set=[(X_tab[n_train:], y_tab[n_train:])],
+    eval_name=["val"], eval_metric=["rmse"],
+    **TABNET_FIT,
+)
+
+y_pred_tab = tabnet.predict(X_tab).ravel()
+print(f"  TabNet R² = {r2_score(y_all, y_pred_tab):.4f} | "
+      f"RMSE = {np.sqrt(mean_squared_error(y_all, y_pred_tab)):.4f}")
+
+tabnet.save_model(str(MODEL_DIR / "tabnet_model"))
+
+print("  Computing TabNet SHAP (KernelExplainer — this may take several minutes)...")
+background    = shap.sample(X_tab, 50, random_state=RANDOM_SEED)
+explainer_tab = shap.KernelExplainer(
+    lambda x: tabnet.predict(x.astype(np.float32)).ravel(), background,
+)
+shap_vals_tab = explainer_tab.shap_values(X_tab, nsamples=100, l1_reg="num_features(5)")
+mean_shap_tab = np.abs(shap_vals_tab).mean(axis=0)
+
+df_shap_tab = pd.DataFrame({
+    "Feature":       feat_cols,
+    "TAB_mean_shap": mean_shap_tab,
+    "TAB_rank":      pd.Series(mean_shap_tab).rank(ascending=False).astype(int).values,
+}).sort_values("TAB_mean_shap", ascending=False)
+
+save_table(df_shap_tab.set_index("Feature"), "shap_tabnet.csv", "TabNet SHAP")
+
+# ── STEP 4: Merge SHAP → Table 4 ─────────────────────────────────────────
+section("Merged SHAP Table — Table 4", 4)
+
+df_shap_merged = df_shap_xgb.merge(
+    df_shap_tab[["Feature", "TAB_mean_shap", "TAB_rank"]],
+    on="Feature", how="outer",
+).sort_values("XGB_mean_shap", ascending=False)
+
+df_shap_merged["Label"] = (
+    df_shap_merged["Feature"].map(LABEL_MAP)
+    .fillna(df_shap_merged["Feature"])
+)
+print(df_shap_merged[["Label", "XGB_mean_shap", "XGB_rank",
+                        "TAB_mean_shap", "TAB_rank"]].to_string(index=False))
+save_table(df_shap_merged.set_index("Feature"), "shap_merged_table4.csv", "Table 4")
+
+# ── STEP 5: Figure 3 ──────────────────────────────────────────────────────
+section("Figure 3 — SHAP Beeswarm + Bar", 5)
+
+feat_order = df_shap_xgb["Feature"].tolist()
+feat_idx   = [feat_cols.index(f) for f in feat_order if f in feat_cols]
+feat_labels = [LABEL_MAP.get(f, f) for f in feat_order if f in feat_cols]
+
+fig3a, _ = plt.subplots(figsize=(10, 7))
+shap.summary_plot(
+    shap_vals_xgb[:, feat_idx], X_scaled[:, feat_idx],
+    feature_names=feat_labels, plot_type="dot", show=False,
+    color_bar=True, max_display=len(feat_labels), plot_size=None,
+)
+plt.gca().set_title(
+    f"Figure 3. SHAP Beeswarm — XGBoost  (N = {len(X_scaled)})\n"
+    "Blue = low feature value → red = high. "
+    "Positive SHAP = association with inequality increase.",
+    fontsize=9, pad=10,
+)
+plt.tight_layout()
+save_figure(fig3a, "figure3_shap_beeswarm.png")
+
+top_n  = min(10, len(df_shap_merged))
+df_top = df_shap_merged.head(top_n).copy()
+x_pos  = np.arange(len(df_top))
+width  = 0.38
+
+fig3b, ax = plt.subplots(figsize=(11, 6))
+ax.barh(x_pos + width / 2, df_top["XGB_mean_shap"], width,
+        color="#2B5FA5", alpha=0.85, label="XGBoost")
+ax.barh(x_pos - width / 2, df_top["TAB_mean_shap"], width,
+        color="#E07B39", alpha=0.85, label="TabNet")
+ax.set_yticks(x_pos)
+ax.set_yticklabels(df_top["Label"].tolist(), fontsize=9)
+ax.set_xlabel("Mean |SHAP| Value")
+ax.set_title(
+    f"Figure 3 (panel B). SHAP Feature Importance — XGBoost vs TabNet\n"
+    f"N = {len(X_scaled)}"
+)
+ax.legend(fontsize=9)
+ax.axvline(0, color="black", linewidth=0.8)
+ax.grid(axis="x", alpha=0.25, linestyle=":")
+plt.tight_layout()
+save_figure(fig3b, "figure3b_shap_bar.png")
+
+# ── STEP 6: CausalForestDML — Baseline ────────────────────────────────────
+section("CausalForestDML — Baseline Estimation", 6)
+
+X_cf = df_model[x_cols].values.astype(np.float64)
+W_cf = df_model[w_cols].values.astype(np.float64) if w_cols else None
+Y_cf = df_model[Y_COL].values.astype(np.float64)
+T_cf = (df_model[T_COL].values >= 0.5).astype(int)
+
+print(f"  N = {len(Y_cf)}"
+      f"  |  X: {X_cf.shape[1]} cols"
+      f"  |  W: {W_cf.shape[1] if W_cf is not None else 0} cols"
+      f"  |  Treated: {T_cf.sum()} ({T_cf.mean():.1%})")
+
+cf = CausalForestDML(
+    model_y=RandomForestRegressor(
+        n_estimators=200, max_depth=10, min_samples_leaf=5,
+        random_state=RANDOM_SEED, n_jobs=-1,
+    ),
+    model_t=RandomForestClassifier(
+        n_estimators=200, max_depth=10, min_samples_leaf=5,
+        random_state=RANDOM_SEED, n_jobs=-1,
+    ),
+    discrete_treatment=True,
+    n_estimators=500,
+    min_samples_leaf=10,
+    max_samples=0.5,
+    inference=True,
+    random_state=RANDOM_SEED,
+    n_jobs=-1,
+)
+cf.fit(Y=Y_cf, T=T_cf, X=X_cf, W=W_cf)
+
+ate   = float(cf.ate(X_cf))
+ci    = cf.ate_interval(X_cf, alpha=0.05)
+ci_lo, ci_hi = float(ci[0]), float(ci[1])
+print(f"  ATE = {ate:.4f}  95% CI [{ci_lo:.4f}, {ci_hi:.4f}]")
+
+joblib.dump(cf, MODEL_DIR / "causal_forest_baseline.pkl")
+
+save_table(
+    pd.DataFrame([{
+        "ATE": ate, "CI_lower": ci_lo, "CI_upper": ci_hi,
+        "N_obs": len(Y_cf), "N_treated": int(T_cf.sum()),
+        "pct_treated": round(T_cf.mean(), 4),
+    }]),
+    "ate_summary.csv", "Full-sample ATE",
+)
+
+# Individual CATEs (required by 04_blp_subsample.py and 06_blp_cluster_bootstrap.py)
+cate_vals = cf.effect(X_cf)
+id_cols   = [c for c in ["country_code", "year"] if c in df_model.columns]
+df_cate   = df_model[id_cols].copy().reset_index(drop=True)
+df_cate["cate"] = cate_vals
+for i, col in enumerate(x_cols):
+    df_cate[col] = X_cf[:, i]
+save_table(df_cate, "cate_individual.csv", "Individual CATEs → used by 04, 06")
+
+# Country-level CATEs (Table 2 / Figure 2)
+df_cate["_cc"] = df_model["country_code"].values
+cate_by_country = (
+    df_cate.groupby("_cc")
+    .apply(lambda g: pd.Series({
+        "cate_mean": g["cate"].mean(),
+        "cate_lb":   np.percentile(g["cate"], 2.5),
+        "cate_ub":   np.percentile(g["cate"], 97.5),
+        "n_obs":     len(g),
+    }))
+    .reset_index()
+    .rename(columns={"_cc": "country_code"})
+)
+save_table(
+    cate_by_country.set_index("country_code"),
+    "cate_by_country.csv", "Country-level CATEs → Table 2 / Figure 2",
+)
+
+# ── Summary ────────────────────────────────────────────────────────────────
+print(f"\n{'='*70}")
+print("DONE — 01_tabnet_causal.py")
+print(f"  Next step: python code/02_policy_sim.py")
+print("="*70)
